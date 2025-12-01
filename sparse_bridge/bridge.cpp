@@ -79,7 +79,7 @@ class SparseQRSolver {
 
         this->rows = (int) n_rows;
         this->cols = (int) n_cols;
-}
+    }
 
     ~SparseQRSolver() {
         SparseCleanup(this->numeric);
@@ -107,15 +107,14 @@ class SparseQRSolver {
         auto X = torch::zeros_like(B);
 
         if (b_cols == 1) {
-        //single right hand side
-        CHECK_CONTIGUOUS(B);
-        DenseVector_Double b_vec = { .data = B.data_ptr<double>(), .count = (int)this->rows, };
-        DenseVector_Double x_vec = { .data = X.data_ptr<double>(), .count = (int)this->cols, };
+            //single right hand side
+            CHECK_CONTIGUOUS(B);
+            DenseVector_Double b_vec = { .data = B.data_ptr<double>(), .count = (int)this->rows, };
+            DenseVector_Double x_vec = { .data = X.data_ptr<double>(), .count = (int)this->cols, };
 
-        SparseSolve(this->numeric, b_vec, x_vec);
+            SparseSolve(this->numeric, b_vec, x_vec);
 
         } else {
-
             //batch matrix
             TORCH_CHECK(B.stride(0) == 1, 
                 "column major b");
@@ -149,11 +148,48 @@ class SparseQRSolver {
         return X;
     }
 
+    torch::Tensor get_grad_a_helper(torch::Tensor col_starts,
+                                    torch::Tensor row_indices,
+                                    torch::Tensor grad_b,
+                                    torch::Tensor x,
+                                    int64_t n_rows,
+                                    int64_t n_cols) {
+        
+        CHECK_CONTIGUOUS(col_starts); 
+        CHECK_CONTIGUOUS(row_indices); 
+        CHECK_CONTIGUOUS(grad_b); 
+        CHECK_CONTIGUOUS(x); 
+
+        long nnz = row_indices.numel();
+        auto grad_a = torch::zeros({nnz}, torch::dtype(torch::kFloat64));
+
+        long* col_ptr = (long*) col_starts.data_ptr<int64_t>();
+        int64_t* row_ptr = row_indices.data_ptr<int64_t>();
+
+        double* grad_b_ptr = grad_b.data_ptr<double>();
+        double* x_ptr = x.data_ptr<double>();
+        double* grad_a_ptr = grad_a.data_ptr<double>();
+
+        for (long j = 0; j < n_cols; j++) {
+            long start = col_ptr[j];
+            long end = col_ptr[j+1];
+
+            double x_val = x_ptr[j];
+            for (long idx = start; idx < end; idx++) {
+                long i = row_ptr[idx];
+                grad_a_ptr[idx] += -grad_b_ptr[i] * x_val;
+            }
+        }
+
+        return grad_a;
+    }
+
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<SparseQRSolver>(m, "SparseQRSolver")
         .def(py::init<torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t>())
-        .def("solve", &SparseQRSolver::solve);
+        .def("solve", &SparseQRSolver::solve)
+        .def("get_grad_a_helper", &SparseQRSolver::get_grad_a_helper);
 }
 

@@ -7,7 +7,7 @@ from torch.utils.cpp_extension import load
 
 print("Compiling Extension...")
 mps_sparse = load(
-    name="mps_sparse_class",
+    name="mps_sparse",
     sources=["bridge.cpp"],
     extra_ldflags=["-framework", "Accelerate"],
     verbose=False
