@@ -1,1 +1,4 @@
 sparse_bridge/__pycache__/
+feasibility/fma_sparse/initial_feasibility_testing.xcodeproj/
+*.DS_Store
+
