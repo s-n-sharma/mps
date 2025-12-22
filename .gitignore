@@ -2,4 +2,7 @@ sparse_bridge/__pycache__/
 feasibility/fma_sparse/initial_feasibility_testing.xcodeproj/
 *.DS_Store
 spmv_kernel/coo_csr/coo_csr/coo_csr.xcodeproj/
-
+spmv_kernel/coo_csr/coo_csr/coo_csr/build/
+spmv_kernel/coo_csr/coo_csr/coo_csr/coo_csr.egg-info/
+spmv_kernel/coo_csr/coo_csr/coo_csr/metal-cpp/
+spmv_kernel/coo_csr/coo_csr/coo_csr/shaders.metallib
