@@ -14,6 +14,7 @@
 
 const uint32_t THREADS_PER_GROUP = 256;
 const uint32_t SIMD_WIDTH = 32;
+const uint32_t CHECK_ITERATION_NUMBER = 100;
 
 using namespace std;
 float ONE = 1.0;
@@ -44,7 +45,9 @@ class csr_tensor {
         MTL::ComputePipelineState* pso_zero;        
         MTL::ComputePipelineState* pso_divider;
         MTL::ComputePipelineState* pso_waddb;  
-        MTL::ComputePipelineState* pso_up_buff;                
+        MTL::ComputePipelineState* pso_up_buff;       
+        MTL::ComputePipelineState* pso_update_xr;
+        MTL::ComputePipelineState* pso_update_p;         
 
         uint num_rows;
         uint num_cols;
@@ -287,6 +290,9 @@ class csr_tensor {
             this->pso_divider = loadKernel("divides");
             //this->pso_waddb = loadKernel("weighted_add_buffer");
             this->pso_up_buff = loadKernel("iter_update_buffer");
+            this->pso_update_xr = loadKernel("update_xr");
+            this->pso_update_p = loadKernel("update_p");
+            
             library->release();
 
             libraryPath = NS::String::string("./coo_csr.metallib", NS::UTF8StringEncoding);
@@ -352,12 +358,12 @@ class csr_tensor {
             MTL::ComputeCommandEncoder* enc
         ) {
            
-            enc->setComputePipelineState(this->pso_zero);
-            enc->setBuffer(out, 0, 0);
-            enc->dispatchThreads(MTL::Size::Make(1, 1, 1), MTL::Size::Make(1, 1, 1));
+            // enc->setComputePipelineState(this->pso_zero);
+            // enc->setBuffer(out, 0, 0);
+            // enc->dispatchThreads(MTL::Size::Make(1, 1, 1), MTL::Size::Make(1, 1, 1));
 
 
-            enc->memoryBarrier(MTL::BarrierScopeBuffers);
+            //enc->memoryBarrier(MTL::BarrierScopeBuffers);
             enc->setComputePipelineState(this->pso_iprd);
             enc->setBuffer(a, 0, 0);
             enc->setBuffer(b, 0, 1);
@@ -503,7 +509,19 @@ class csr_tensor {
              enc->setBuffer(a, 0, 0);
              enc->setBuffer(b, 0, 1);
              enc->setBuffer(c, 0, 2);
-             enc->dispatchThreads(MTL::Size::Make(1, 1, 1),  MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
+             enc->dispatchThreads(MTL::Size::Make(1, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
+        }
+
+        void zero(
+            MTL::Buffer* x,
+            MTL::Buffer* y,
+            MTL::CommandBuffer* cmd,
+            MTL::ComputeCommandEncoder* enc
+        ) {
+            enc->setComputePipelineState(this->pso_zero);
+            enc->setBuffer(x, 0, 0);
+            enc->setBuffer(y, 0, 1);
+            enc->dispatchThreads(MTL::Size::Make(1, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
         }
 
 
@@ -561,47 +579,128 @@ class csr_tensor {
             float* x_vals,
             float* b_vals
         ) {
-            MTL::Buffer* x_test = this->device->newBuffer(this->num_cols * sizeof(float), MTL::ResourceStorageModePrivate);
-            MTL::Buffer* b_goal = this->device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
-            MTL::Buffer* stage_b = this->device->newBuffer(b_vals, num_rows*sizeof(float), MTL::ResourceStorageModeShared);
-            MTL::Buffer* r_k = this->device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate); 
-            MTL::Buffer* p_k = this->device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
-            MTL::Buffer* alpha_k_nom = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate);
-            MTL::Buffer* alpha_k_denom = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate);
-            MTL::Buffer* scratch1 = this->device->newBuffer(sizeof(float) * this->num_rows, MTL::ResourceStorageModePrivate);
+            MTL::Buffer* x = this->device->newBuffer(this->num_cols * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* stage_b = this->device->newBuffer(b_vals, this->num_rows*sizeof(float), MTL::ResourceStorageModeShared);
+            MTL::Buffer* r = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* p = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* Ap = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
 
+            MTL::Buffer* r_norm_old = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* r_norm_new = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* p_A_p = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate);
 
             MTL::CommandBuffer* cmd_blit = queue->commandBuffer();
             MTL::BlitCommandEncoder* blit_init = cmd_blit->blitCommandEncoder();
 
-            blit_init->copyFromBuffer(stage_b, 0, b_goal, 0, this->num_rows * sizeof(float));
-            blit_init->fillBuffer(x_test, NS::Range::Make(0, this->num_cols * sizeof(float)), 0);
-            blit_init->copyFromBuffer(stage_b, 0, r_k, 0, this->num_rows * sizeof(float));
-            blit_init->copyFromBuffer(stage_b, 0, p_k, 0, this->num_rows * sizeof(float));
+            blit_init->fillBuffer(x, NS::Range::Make(0, this->num_cols * sizeof(float)), 0);
+            blit_init->copyFromBuffer(stage_b, 0, r, 0, this->num_rows * sizeof(float));
+            blit_init->copyFromBuffer(stage_b, 0, p, 0, this->num_rows * sizeof(float));
             blit_init->endEncoding();
             cmd_blit->commit();
             cmd_blit->waitUntilCompleted();
             
             stage_b->release();
 
+            MTL::CommandBuffer* cmd_pre = queue->commandBuffer();
+            MTL::ComputeCommandEncoder* enc_pre = cmd_pre->computeCommandEncoder();
+
+            zero(r_norm_old, r_norm_new, cmd_pre, enc_pre);
+            zero(r_norm_old, p_A_p, cmd_pre, enc_pre);
+
+            enc_pre->memoryBarrier(MTL::BarrierScopeBuffers);
+
+            inner_product(r, r, r_norm_old, this->num_rows, cmd_pre, enc_pre);
+            enc_pre->endEncoding();
+            cmd_pre->commit();
+            cmd_pre->waitUntilCompleted();
+
+            //cout << "I HATE CGD \n I HATE THIS \n";
+
             MTL::CommandBuffer* cmd = queue->commandBuffer();
             MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
+
+            MTL::Buffer* curr_r_norm = r_norm_old;
+            MTL::Buffer* next_r_norm = r_norm_new;
 
 
             int iter_number = (1000 < this->num_rows) ? 1000 : this->num_rows;
             for (int i = 0; i < iter_number; i++) {
-                iterative_step(x_test, r_k, p_k, alpha_k_nom, alpha_k_denom, scratch1, cmd, enc);
+
+                mv_buffer(p, Ap, cmd, enc);
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                zero(p_A_p, next_r_norm, cmd, enc);
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                inner_product(p, Ap, p_A_p, this->num_rows, cmd, enc);
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+                
+                // zero(next_r_norm, cmd, enc);
+                // enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                enc->setComputePipelineState(pso_update_xr);
+                enc->setBuffer(x, 0, 0);
+                enc->setBuffer(r, 0, 1);
+                enc->setBuffer(p, 0, 2);
+                enc->setBuffer(Ap, 0, 3);
+                enc->setBuffer(curr_r_norm, 0, 4); 
+                enc->setBuffer(p_A_p, 0, 5);   
+                enc->setBuffer(next_r_norm, 0, 6); 
+                enc->setBytes(&this->num_rows, sizeof(uint), 7);
+                enc->dispatchThreads(MTL::Size::Make(this->num_rows, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                enc->setComputePipelineState(this->pso_update_p);
+                enc->setBuffer(p, 0, 0);
+                enc->setBuffer(r, 0, 1);
+                enc->setBuffer(curr_r_norm, 0, 2); 
+                enc->setBuffer(next_r_norm, 0, 3); 
+                enc->setBytes(&this->num_rows, sizeof(uint), 4);
+                enc->dispatchThreads(MTL::Size::Make(this->num_rows, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                if (i % CHECK_ITERATION_NUMBER == 0) {
+                    //blit back curr_r_norm
+                    enc->endEncoding();
+                    cmd->commit();
+                    cmd->waitUntilCompleted();
+
+                    MTL::Buffer* stage_r_norm = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
+                    
+                    cmd = queue->commandBuffer();
+                    MTL::BlitCommandEncoder* blit_check = cmd->blitCommandEncoder();
+                    blit_check->copyFromBuffer(curr_r_norm, 0, stage_r_norm, 0, sizeof(float));
+                    blit_check->endEncoding();
+                    cmd->commit();
+                    cmd->waitUntilCompleted();
+
+                    if (*(float*) stage_r_norm->contents() < 1e-5) {
+                        cmd = queue->commandBuffer();
+                        enc = cmd->computeCommandEncoder();
+
+                        break;
+                        
+                    }
+
+
+                    cmd = queue->commandBuffer();
+                    enc = cmd->computeCommandEncoder();
+
+                }
+
+                std::swap(curr_r_norm, next_r_norm);
             }
 
             enc->endEncoding();
             cmd->commit();
             cmd->waitUntilCompleted();
 
-            scratch1->release();
-            r_k->release();
-            p_k->release();
-            alpha_k_denom->release();
-            alpha_k_nom->release();
+            r->release();
+            p->release();
+            Ap->release();
+            r_norm_old->release();
+            r_norm_new->release();
+            p_A_p->release();
 
 
             MTL::Buffer* stage_x = this->device->newBuffer(this->num_cols * sizeof(float), MTL::ResourceStorageModeShared);
@@ -609,7 +708,7 @@ class csr_tensor {
             MTL::CommandBuffer* cmd_last = queue->commandBuffer();
             MTL::BlitCommandEncoder* blit_last = cmd_last->blitCommandEncoder();
 
-            blit_last->copyFromBuffer(x_test, 0, stage_x, 0, this->num_cols * sizeof(float));
+            blit_last->copyFromBuffer(x, 0, stage_x, 0, this->num_cols * sizeof(float));
             blit_last->endEncoding();
             cmd_last->commit();
             cmd_last->waitUntilCompleted();

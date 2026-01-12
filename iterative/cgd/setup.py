@@ -6,7 +6,7 @@ import subprocess
 
 def compile_metal(name):
     print(f"Compiling {name}.metal...")
-    os.system(f"= {name}.metal -o {name}.air")
+    os.system(f"xcrun -sdk macosx metal -c {name}.metal -o {name}.air")
     os.system(f"xcrun -sdk macosx metallib {name}.air -o {name}.metallib")
     if os.path.exists(f"{name}.air"):
         os.remove(f"{name}.air")

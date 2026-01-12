@@ -41,6 +41,41 @@ def pack_keys(row_indices, col_indices):
     packed = (row_indices << 32) | col_indices
     return packed
 
+def conjugate_gradient_torch(A, b, x0=None, max_iter=None, tol=1e-3):
+    """
+    Standard Conjugate Gradient implementation in pure PyTorch.
+    Solves Ax = b
+    """
+    if max_iter is None:
+        max_iter = len(b)
+        
+    x = torch.zeros_like(b) if x0 is None else x0
+    
+    # r = b - A @ x
+    r = b - torch.matmul(A, x)
+    p = r.clone()
+    rsold = torch.dot(r, r)
+    
+    for i in range(max_iter):
+        # Ap = A @ p
+        Ap = torch.matmul(A, p)
+        
+        alpha = rsold / torch.dot(p, Ap)
+        x = x + alpha * p
+        r = r - alpha * Ap
+        
+        rsnew = torch.dot(r, r)
+        
+        # Check convergence
+        if torch.sqrt(rsnew) < tol:
+            print(f"   -> PyTorch CG converged in {i+1} iterations.")
+            break
+            
+        p = r + (rsnew / rsold) * p
+        rsold = rsnew
+        
+    return x
+
 def benchmark(n_rows=40108, density=0.05):
     # --- 1. Data Preparation ---
     A_sparse, A_dense = generate_spd_matrix(n_rows, n_rows, density)
@@ -79,8 +114,8 @@ def benchmark(n_rows=40108, density=0.05):
     end_init = time.time()
     print(f"Initialization (COO->CSR on GPU) took: {(end_init - start_init)*1000:.2f} ms")
 
-    # --- 3. Run Benchmark ---
-    print("\nStarting Solver Benchmark...")
+    # --- 3. Run Benchmark (Custom Solver) ---
+    print("\nStarting Custom Solver Benchmark...")
     
     # Warmup
     x_warmup = torch.zeros_like(x_sol)
@@ -95,58 +130,57 @@ def benchmark(n_rows=40108, density=0.05):
         tensor_impl.iter_solve(b, x_sol)
         t1 = time.time()
         timings.append((t1 - t0) * 1000)
-        print("b_loop", b)
-        print("x_sol", x_sol)
 
     avg_time = sum(timings) / len(timings)
-    print(f"Average Solve Time (custom CGD): {avg_time:.2f} ms")
+    print(f"Average Solve Time (Custom CGD): {avg_time:.2f} ms")
 
     # --- 4. Validation ---
     
     # CHECK 1: Did the solver explode?
     if torch.isnan(x_sol).any() or torch.isinf(x_sol).any():
         print("\n❌ CRITICAL: The solver output contains NaNs or Infs.")
-        print("   -> This means the solver diverged (exploded).")
-        print("   -> Try increasing diagonal regularization or checking C++ dot-product logic.")
     else:
         # CHECK 2: Calculate Residual with Safe Division
         b_pred = torch.matmul(A_dense, x_sol)
-        print(b_pred)
-        print(b)
-        print(torch.norm(b_pred - b))
         
-        # Add epsilon (1e-8) to denominator to prevent division by zero
         epsilon = 1e-8
         numerator = torch.norm(b_pred - b)
         denominator = torch.norm(b) + epsilon
-        
         residual = numerator / denominator
         
-        print(f"\n--- Results ---")
-        print(f"Numerator (Error Norm): {numerator:.6e}")
-        print(f"Denominator (Target Norm): {denominator:.6e}")
+        print(f"\n--- Results (Custom) ---")
         print(f"Relative Residual: {residual.item():.6e}")
         
         if residual.item() < 1e-3:
-            print("✅ Solver Converged!")
+            print("✅ Custom Solver Converged!")
         else:
-            print("⚠️ Solver did not converge fully.")
+            print("⚠️ Custom Solver did not converge fully.")
 
-    # --- 5. Comparison ---
-    print("\nRunning PyTorch Dense Cholesky Solve (CPU) for comparison...")
+    # --- 5. Comparison (PyTorch CG) ---
+    print("\nRunning PyTorch Native Conjugate Gradient (CPU) for comparison...")
+    
+    # We use A_dense for the PyTorch baseline to ensure standard matmul behavior, 
+    # but the algorithm is the same (CG).
+    
     t0 = time.time()
     try:
-        x_torch = torch.linalg.solve(A_dense, b)
+        # Using a relaxed tolerance or fixed max_iter to match standard GPU performance expectations
+        # You can adjust max_iter=... to match the iteration count of your C++ solver if known
+        x_torch = conjugate_gradient_torch(A_dense, b, max_iter=100, tol=1e-3)
         t1 = time.time()
-        print(f"PyTorch Dense Solve Time: {(t1-t0)*1000:.2f} ms")
+        
+        py_time = (t1-t0)*1000
+        print(f"PyTorch Native CG Time: {py_time:.2f} ms")
+        print(f"Speedup vs PyTorch: {py_time / avg_time:.2f}x")
+        
     except Exception as e:
-        print(f"PyTorch Solve failed (Matrix might be singular): {e}")
+        print(f"PyTorch CG failed: {e}")
 
 if __name__ == "__main__":
     os.system("pip install . --no-build-isolation") 
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=10000)
+    parser.add_argument("--rows", type=int, default=15000)
     parser.add_argument("--density", type=float, default=0.05)
     args = parser.parse_args()
     

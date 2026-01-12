@@ -32,7 +32,7 @@ kernel void spmv_op(
 ) {
     uint row = (bid*(THREADGROUP_SIZE/SIMD_WIDTH) + sid);
 
-    if (row > num_rows) {
+    if (row >= num_rows) {
         return;
     }
 
@@ -56,6 +56,55 @@ kernel void spmv_op(
         b[row] = complete_sum;
     }
 
+}
+
+kernel void update_xr(
+    device float* x [[buffer(0)]],
+    device float* r [[buffer(1)]],
+    device const float* p [[buffer(2)]],
+    device const float* Ap [[buffer(3)]],     
+    device const float* r_dot_r [[buffer(4)]], 
+    device const float* p_Ap [[buffer(5)]],  
+    device atomic_float* r_norm_new [[buffer(6)]],
+    constant uint& size [[buffer(7)]],
+    uint gid [[thread_position_in_grid]],
+    uint tid [[thread_index_in_simdgroup]]
+) {
+
+    float micro_r_sum = 0.0;
+
+    if (gid < size) {
+        float alpha = 0.0;
+
+        if (abs(p_Ap[0]) > 1e-9) {
+            alpha = r_dot_r[0] / p_Ap[0];
+        }
+
+        x[gid] = x[gid] + alpha * p[gid];
+        r[gid] = r[gid] - alpha * Ap[gid];
+        micro_r_sum = r[gid] * r[gid];
+    }
+
+    float local_r_sum = simd_sum(micro_r_sum);
+
+    if (tid == 0) {
+        atomic_fetch_add_explicit(r_norm_new, local_r_sum, memory_order_relaxed);
+    }
+    
+}
+
+kernel void update_p(
+    device float* p [[buffer(0)]],
+    device const float* r [[buffer(1)]],
+    device const float* r_norm_old [[buffer(2)]],
+    device const float* r_norm_new [[buffer(3)]],
+    constant uint& size [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= size) {
+        return;
+    }
+    p[gid] = r[gid] + (r_norm_new[0]/r_norm_old[0]) * p[gid];
 }
 
 kernel void weighted_add(
@@ -92,9 +141,11 @@ kernel void inner_product(
 }
 
 kernel void zero_out(
-    device float* in [[buffer(0)]]
+    device float* in1 [[buffer(0)]],
+    device float* in2 [[buffer(1)]]
 ) {
-    in[0] = 0.0;
+    in1[0] = 0.0;
+    in2[0] = 0.0;
 }
 
 
@@ -131,6 +182,7 @@ kernel void iter_update_buffer(
         c[gid] = a[gid] - weight_b[0] * b[gid];
     }
 }
+
 
 
 
