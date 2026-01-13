@@ -130,6 +130,7 @@ def benchmark(n_rows=40108, density=0.05):
         tensor_impl.iter_solve(b, x_sol)
         t1 = time.time()
         timings.append((t1 - t0) * 1000)
+        print("x ", x_sol)
 
     avg_time = sum(timings) / len(timings)
     print(f"Average Solve Time (Custom CGD): {avg_time:.2f} ms")
@@ -166,7 +167,7 @@ def benchmark(n_rows=40108, density=0.05):
     try:
         # Using a relaxed tolerance or fixed max_iter to match standard GPU performance expectations
         # You can adjust max_iter=... to match the iteration count of your C++ solver if known
-        x_torch = conjugate_gradient_torch(A_dense, b, max_iter=100, tol=1e-3)
+        x_torch = conjugate_gradient_torch(A_dense, b, max_iter=1000, tol=1e-3)
         t1 = time.time()
         
         py_time = (t1-t0)*1000
@@ -180,8 +181,8 @@ if __name__ == "__main__":
     os.system("pip install . --no-build-isolation") 
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=15000)
-    parser.add_argument("--density", type=float, default=0.05)
+    parser.add_argument("--rows", type=int, default=7000)
+    parser.add_argument("--density", type=float, default=0.01)
     args = parser.parse_args()
     
     benchmark(args.rows, args.density)

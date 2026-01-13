@@ -14,7 +14,7 @@
 
 const uint32_t THREADS_PER_GROUP = 256;
 const uint32_t SIMD_WIDTH = 32;
-const uint32_t CHECK_ITERATION_NUMBER = 100;
+const uint32_t CHECK_ITERATION_NUMBER = 50;
 
 using namespace std;
 float ONE = 1.0;
@@ -47,7 +47,8 @@ class csr_tensor {
         MTL::ComputePipelineState* pso_waddb;  
         MTL::ComputePipelineState* pso_up_buff;       
         MTL::ComputePipelineState* pso_update_xr;
-        MTL::ComputePipelineState* pso_update_p;         
+        MTL::ComputePipelineState* pso_update_p;     
+        MTL::ComputePipelineState* pso_spvmv;    
 
         uint num_rows;
         uint num_cols;
@@ -292,6 +293,7 @@ class csr_tensor {
             this->pso_up_buff = loadKernel("iter_update_buffer");
             this->pso_update_xr = loadKernel("update_xr");
             this->pso_update_p = loadKernel("update_p");
+            this->pso_spvmv = loadKernel("fused_spvmv");
             
             library->release();
 
@@ -342,6 +344,32 @@ class csr_tensor {
             enc->setBuffer(b, 0, 4);
             enc->setBytes(&this->num_rows, sizeof(uint32_t), 5);
             enc->setBytes(&this->num_cols, sizeof(uint32_t), 6);
+
+            uint32_t total_threads_needed = SIMD_WIDTH * this->num_rows;
+
+
+            enc->dispatchThreads(MTL::Size::Make(total_threads_needed, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
+        }
+
+
+        void spvmv(
+            MTL::Buffer* x,
+            MTL::Buffer* y,
+            MTL::Buffer* z,
+            MTL::Buffer* ret,
+            MTL::CommandBuffer* cmd, 
+            MTL::ComputeCommandEncoder* enc
+        ) {
+            enc->setComputePipelineState(this->pso_spvmv);
+            enc->setBuffer(this->row_ptr, 0, 0);
+            enc->setBuffer(this->col_ind, 0, 1);
+            enc->setBuffer(this->vals, 0, 2);
+            enc->setBuffer(x, 0, 3);
+            enc->setBuffer(y, 0, 4);
+            enc->setBuffer(z, 0, 5);
+            enc->setBuffer(ret, 0, 6);
+            enc->setBytes(&this->num_rows, sizeof(uint32_t), 7);
+            enc->setBytes(&this->num_cols, sizeof(uint32_t), 8);
 
             uint32_t total_threads_needed = SIMD_WIDTH * this->num_rows;
 
@@ -614,29 +642,23 @@ class csr_tensor {
             cmd_pre->commit();
             cmd_pre->waitUntilCompleted();
 
-            //cout << "I HATE CGD \n I HATE THIS \n";
-
             MTL::CommandBuffer* cmd = queue->commandBuffer();
             MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
 
             MTL::Buffer* curr_r_norm = r_norm_old;
             MTL::Buffer* next_r_norm = r_norm_new;
 
+            int counter = 0;
+
 
             int iter_number = (1000 < this->num_rows) ? 1000 : this->num_rows;
             for (int i = 0; i < iter_number; i++) {
 
-                mv_buffer(p, Ap, cmd, enc);
-                enc->memoryBarrier(MTL::BarrierScopeBuffers);
-
                 zero(p_A_p, next_r_norm, cmd, enc);
                 enc->memoryBarrier(MTL::BarrierScopeBuffers);
 
-                inner_product(p, Ap, p_A_p, this->num_rows, cmd, enc);
+                spvmv(p, p, Ap, p_A_p, cmd, enc);
                 enc->memoryBarrier(MTL::BarrierScopeBuffers);
-                
-                // zero(next_r_norm, cmd, enc);
-                // enc->memoryBarrier(MTL::BarrierScopeBuffers);
 
                 enc->setComputePipelineState(pso_update_xr);
                 enc->setBuffer(x, 0, 0);
@@ -689,6 +711,7 @@ class csr_tensor {
                 }
 
                 std::swap(curr_r_norm, next_r_norm);
+                counter++;
             }
 
             enc->endEncoding();
@@ -702,6 +725,8 @@ class csr_tensor {
             r_norm_new->release();
             p_A_p->release();
 
+            //cout << "i hate ts \n";
+
 
             MTL::Buffer* stage_x = this->device->newBuffer(this->num_cols * sizeof(float), MTL::ResourceStorageModeShared);
 
@@ -714,6 +739,7 @@ class csr_tensor {
             cmd_last->waitUntilCompleted();
 
             memcpy(x_vals, stage_x->contents(), (this->num_cols) * sizeof(float));
+
 
             stage_x->release();
 
