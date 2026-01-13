@@ -564,6 +564,7 @@ class csr_tensor {
             MTL::ComputeCommandEncoder* enc
         ) {
 
+            //NOT USED ANYMORE, WILL REMOVE
             //one step for CGD
 
             inner_product(r_k, r_k, alpha_k_num, this->num_rows, cmd, enc); //calculate numerator of step size update (r_k^T r_k)
