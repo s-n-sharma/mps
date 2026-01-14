@@ -92,7 +92,7 @@ Performance Results
 ![ML Matrices](graphs/benchmark_ml_results.png)
 ![Physics Matrices](graphs/benchmark_physics_results.png)
 
-## Future Steps on CGD
+# Future Steps 
 
-For CGD, our goal is to implement Blocked CSR (BCSR) to speed up operations. We also hope to implement adaptive kernels; this will likely take longer and may not happen for a while.
+Our COO to CSR conversion occurs on the GPU but takes longer than anticipated, so a major goal is to optimize those kernels. For CGD, our goal is to implement Blocked CSR (BCSR) to speed up operations. We also hope to implement adaptive kernels; this will likely take longer and may not happen for a while.
 
