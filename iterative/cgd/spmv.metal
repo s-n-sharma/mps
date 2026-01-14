@@ -68,10 +68,21 @@ kernel void update_xr(
     device atomic_float* r_norm_new [[buffer(6)]],
     constant uint& size [[buffer(7)]],
     uint gid [[thread_position_in_grid]],
-    uint tid [[thread_index_in_simdgroup]]
+    uint tid [[thread_index_in_simdgroup]],
+    uint sid [[simdgroup_index_in_threadgroup]],
+    uint lid [[thread_position_in_threadgroup]]
 ) {
 
     float micro_r_sum = 0.0;
+
+    threadgroup float temp[THREADGROUP_SIZE/SIMD_WIDTH];
+    
+    if (lid < (THREADGROUP_SIZE / SIMD_WIDTH)) {
+        temp[lid] = 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
 
     if (gid < size) {
         float alpha = 0.0;
@@ -88,8 +99,25 @@ kernel void update_xr(
     float local_r_sum = simd_sum(micro_r_sum);
 
     if (tid == 0) {
-        atomic_fetch_add_explicit(r_norm_new, local_r_sum, memory_order_relaxed);
+        temp[sid] = local_r_sum;
+        //atomic_fetch_add_explicit(r_norm_new, local_r_sum, memory_order_relaxed);
     }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+        float thread_group_sum = 0.0f;
+
+        for (int i = 0; i < THREADGROUP_SIZE/SIMD_WIDTH; i++) {
+            thread_group_sum += temp[i];
+        }
+
+        if (thread_group_sum != 0.0 && !isnan(thread_group_sum)) {
+            atomic_fetch_add_explicit(r_norm_new, thread_group_sum, memory_order_relaxed);
+        }
+    }    
+
+
     
 }
 

@@ -202,9 +202,9 @@ if __name__ == "__main__":
     os.system("pip install . --no-build-isolation") 
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, choices=["ml", "physics"], default="ml")
-    parser.add_argument("--size", type=int, default=18976) # Matrix row count
-    parser.add_argument("--density", type=float, default=0.015)
+    parser.add_argument("--mode", type=str, choices=["ml", "physics"], default="physics")
+    parser.add_argument("--size", type=int, default=1000) # Matrix row count
+    parser.add_argument("--density", type=float, default=0.02)
     args = parser.parse_args()
     
     run_benchmark(args.mode, args.size, args.density)
