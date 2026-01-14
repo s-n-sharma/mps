@@ -97,7 +97,7 @@ Performance Results
 ![ML Matrices](graphs/benchmark_ml_results.png)
 ![Physics Matrices](graphs/benchmark_physics_results.png)
 
-#BiCGSTAB
+# BiCGSTAB
 
 # Future Steps 
 
