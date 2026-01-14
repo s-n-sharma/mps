@@ -6,7 +6,7 @@ An implementation of sparse matrix operations using Apple's Metal Performance Sh
 * COO to CSR converters
 * CGD
 
-TODO:
+## TODO
 * Test COO to CSR converter, drag race against CUDA impl
 * Test SpMV kernel, again vs. CUDA impl
 * Implement sparse QR in CUDA (reference)
