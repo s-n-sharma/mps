@@ -285,14 +285,7 @@ class csr_tensor {
             };
 
             this->pso_spmv = loadKernel("spmv_op");
-            this->pso_wadd = loadKernel("weighted_add");
             this->pso_iprd = loadKernel("inner_product");
-            this->pso_zero = loadKernel("zero_out");
-            this->pso_divider = loadKernel("divides");
-            //this->pso_waddb = loadKernel("weighted_add_buffer");
-            this->pso_up_buff = loadKernel("iter_update_buffer");
-            this->pso_update_xr = loadKernel("update_xr");
-            this->pso_update_p = loadKernel("update_p");
             this->pso_spvmv = loadKernel("fused_spvmv");
             
             library->release();
@@ -305,6 +298,7 @@ class csr_tensor {
                 return;
             }
 
+            
             this->pso_freq = loadKernel("radix_frequencies");
             this->pso_vscan = loadKernel("vertical_scan");
             this->pso_gscan = loadKernel("scan_histogram");
@@ -314,6 +308,21 @@ class csr_tensor {
                     
             
             library->release();
+
+            libraryPath = NS::String::string("./coo_csr.metallib", NS::UTF8StringEncoding);
+            library = device->newLibrary(libraryPath, &error);
+
+            if (!library) {
+                std::cerr << "Failed to load library: " << error->localizedDescription()->utf8String() << std::endl;
+                return;
+            }
+
+            this->pso_zero = loadKernel("zero_out");
+            this->pso_update_xr = loadKernel("update_xr");
+            this->pso_update_p = loadKernel("update_p");
+
+            library->release();
+
         }
 
         ~csr_tensor() {
@@ -386,12 +395,6 @@ class csr_tensor {
             MTL::ComputeCommandEncoder* enc
         ) {
            
-            // enc->setComputePipelineState(this->pso_zero);
-            // enc->setBuffer(out, 0, 0);
-            // enc->dispatchThreads(MTL::Size::Make(1, 1, 1), MTL::Size::Make(1, 1, 1));
-
-
-            //enc->memoryBarrier(MTL::BarrierScopeBuffers);
             enc->setComputePipelineState(this->pso_iprd);
             enc->setBuffer(a, 0, 0);
             enc->setBuffer(b, 0, 1);
@@ -471,23 +474,6 @@ class csr_tensor {
             );
         }
 
-       
-
-        void iter_solve(
-            torch::Tensor b,
-            torch::Tensor x
-        ) {
-            float* x_vals = (float*) x.data_ptr<float>();
-            float* b_vals = (float*) b.data_ptr<float>();
-
-            iterative_op(
-                x_vals,
-                b_vals
-            );
-        }
-
-
-
         void zero(
             MTL::Buffer* x,
             MTL::Buffer* y,
@@ -500,7 +486,21 @@ class csr_tensor {
             enc->dispatchThreads(MTL::Size::Make(1, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
         }
 
-        void iterative_op(
+
+        void cgd(
+            torch::Tensor b,
+            torch::Tensor x
+        ) {
+            float* x_vals = (float*) x.data_ptr<float>();
+            float* b_vals = (float*) b.data_ptr<float>();
+
+            cgd_op(
+                x_vals,
+                b_vals
+            );
+        }
+
+        void cgd_op(
             float* x_vals,
             float* b_vals
         ) {
@@ -622,8 +622,6 @@ class csr_tensor {
             r_norm_new->release();
             p_A_p->release();
 
-            //cout << "i hate ts \n";
-
 
             MTL::Buffer* stage_x = this->device->newBuffer(this->num_cols * sizeof(float), MTL::ResourceStorageModeShared);
 
@@ -642,6 +640,194 @@ class csr_tensor {
 
         }
 
+        void bicgstab(
+            torch::Tensor b,
+            torch::Tensor x
+        ) {
+            float* x_vals = (float*) x.data_ptr<float>();
+            float* b_vals = (float*) b.data_ptr<float>();
+
+            bicgstab_op(
+                x_vals,
+                b_vals
+            );
+        }
+
+        void bicgstab_op(
+            float* x_vals,
+            float* b_vals,
+        ) {
+            MTL::Buffer* x = this->device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* stage_b = this->device->newBuffer(b_vals, this->num_rows*sizeof(float), MTL::ResourceStorageModeShared);
+            MTL::Buffer* r = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* r0 = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* p = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* v = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* s = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* t = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+
+            //contains all the scalars needed for bigcgstab
+            //0 : rho_prev
+            //1 : rho_curr
+            //2 : alpha
+            //3 : omega
+            //4 : sigma
+            //5 : phi1
+            //6 : phi2
+            //7 : r_norm
+            float scalar_buffers_cpu[8] = []
+            MTL::Buffer* scalars = device->newBuffer(8 * sizeof(float), MTL::ResourceStorageModePrivate);
+
+            MTL::Buffer* x = this->device->newBuffer(this->num_cols * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* stage_b = this->device->newBuffer(b_vals, this->num_rows*sizeof(float), MTL::ResourceStorageModeShared);
+            MTL::Buffer* r = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* p = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* Ap = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+
+            MTL::Buffer* r_norm_old = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* r_norm_new = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* p_A_p = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate);
+
+            MTL::CommandBuffer* cmd_blit = queue->commandBuffer();
+            MTL::BlitCommandEncoder* blit_init = cmd_blit->blitCommandEncoder();
+
+            blit_init->fillBuffer(x, NS::Range::Make(0, this->num_cols * sizeof(float)), 0);
+            blit_init->copyFromBuffer(stage_b, 0, r, 0, this->num_rows * sizeof(float));
+            blit_init->copyFromBuffer(stage_b, 0, p, 0, this->num_rows * sizeof(float));
+            blit_init->endEncoding();
+            cmd_blit->commit();
+            cmd_blit->waitUntilCompleted();
+            
+            stage_b->release();
+
+            MTL::CommandBuffer* cmd_pre = queue->commandBuffer();
+            MTL::ComputeCommandEncoder* enc_pre = cmd_pre->computeCommandEncoder();
+
+            zero(r_norm_old, r_norm_new, cmd_pre, enc_pre);
+            zero(r_norm_old, p_A_p, cmd_pre, enc_pre);
+
+            enc_pre->memoryBarrier(MTL::BarrierScopeBuffers);
+
+            inner_product(r, r, r_norm_old, this->num_rows, cmd_pre, enc_pre);
+            enc_pre->endEncoding();
+            cmd_pre->commit();
+            cmd_pre->waitUntilCompleted();
+
+            MTL::CommandBuffer* cmd = queue->commandBuffer();
+            MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
+
+            MTL::Buffer* curr_r_norm = r_norm_old;
+            MTL::Buffer* next_r_norm = r_norm_new;
+
+            int counter = 0;
+
+
+            int iter_number = (1000 < this->num_rows) ? 1000 : this->num_rows;
+            for (int i = 0; i < iter_number; i++) {
+
+                //upp
+                
+
+                //spVmV
+
+                //upalpha_ups
+
+                //f_dip
+
+                //f_upomega_upxr_laa
+
+                //zero
+
+                zero(p_A_p, next_r_norm, cmd, enc);
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                spvmv(p, p, Ap, p_A_p, cmd, enc);
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                enc->setComputePipelineState(pso_update_xr);
+                enc->setBuffer(x, 0, 0);
+                enc->setBuffer(r, 0, 1);
+                enc->setBuffer(p, 0, 2);
+                enc->setBuffer(Ap, 0, 3);
+                enc->setBuffer(curr_r_norm, 0, 4); 
+                enc->setBuffer(p_A_p, 0, 5);   
+                enc->setBuffer(next_r_norm, 0, 6); 
+                enc->setBytes(&this->num_rows, sizeof(uint), 7);
+                enc->dispatchThreads(MTL::Size::Make(this->num_rows, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                enc->setComputePipelineState(this->pso_update_p);
+                enc->setBuffer(p, 0, 0);
+                enc->setBuffer(r, 0, 1);
+                enc->setBuffer(curr_r_norm, 0, 2); 
+                enc->setBuffer(next_r_norm, 0, 3); 
+                enc->setBytes(&this->num_rows, sizeof(uint), 4);
+                enc->dispatchThreads(MTL::Size::Make(this->num_rows, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                if (i % CHECK_ITERATION_NUMBER == 0) {
+                    //blit back curr_r_norm
+                    enc->endEncoding();
+                    cmd->commit();
+                    cmd->waitUntilCompleted();
+
+                    MTL::Buffer* stage_r_norm = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
+                    
+                    cmd = queue->commandBuffer();
+                    MTL::BlitCommandEncoder* blit_check = cmd->blitCommandEncoder();
+                    blit_check->copyFromBuffer(curr_r_norm, 0, stage_r_norm, 0, sizeof(float));
+                    blit_check->endEncoding();
+                    cmd->commit();
+                    cmd->waitUntilCompleted();
+
+                    if (*(float*) stage_r_norm->contents() < 1e-5) {
+                        cmd = queue->commandBuffer();
+                        enc = cmd->computeCommandEncoder();
+
+                        break;
+                        
+                    }
+
+
+                    cmd = queue->commandBuffer();
+                    enc = cmd->computeCommandEncoder();
+
+                }
+
+                std::swap(curr_r_norm, next_r_norm);
+                counter++;
+            }
+
+            enc->endEncoding();
+            cmd->commit();
+            cmd->waitUntilCompleted();
+
+            r->release();
+            p->release();
+            Ap->release();
+            r_norm_old->release();
+            r_norm_new->release();
+            p_A_p->release();
+
+
+            MTL::Buffer* stage_x = this->device->newBuffer(this->num_cols * sizeof(float), MTL::ResourceStorageModeShared);
+
+            MTL::CommandBuffer* cmd_last = queue->commandBuffer();
+            MTL::BlitCommandEncoder* blit_last = cmd_last->blitCommandEncoder();
+
+            blit_last->copyFromBuffer(x, 0, stage_x, 0, this->num_cols * sizeof(float));
+            blit_last->endEncoding();
+            cmd_last->commit();
+            cmd_last->waitUntilCompleted();
+
+            memcpy(x_vals, stage_x->contents(), (this->num_cols) * sizeof(float));
+
+
+            stage_x->release();
+
+
+        }
+
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -656,5 +842,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_rows"),
              py::arg("num_cols"))
         .def("mv", &csr_tensor::mv, "spmvmul")
-        .def("iter_solve", &csr_tensor::iter_solve, "iter_solve");
+        .def("cgd", &csr_tensor::cgd, "cgd");
 }
