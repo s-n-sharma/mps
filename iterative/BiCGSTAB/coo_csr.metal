@@ -191,8 +191,3 @@ kernel void row_fixer(
         }
     }
 }
-
-
-
-
-
