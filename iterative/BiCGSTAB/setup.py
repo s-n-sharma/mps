@@ -13,6 +13,8 @@ def compile_metal(name):
 
 compile_metal("coo_csr")
 compile_metal("spmv")
+compile_metal("cgd")
+compile_metal("bicgstab")
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 metal_cpp_path = os.path.join(current_dir, "metal-cpp")

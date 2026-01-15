@@ -15,6 +15,7 @@
 const uint32_t THREADS_PER_GROUP = 256;
 const uint32_t SIMD_WIDTH = 32;
 const uint32_t CHECK_ITERATION_NUMBER = 50;
+const float TOLERANCE = 1e-5;
 
 using namespace std;
 float ONE = 1.0;
@@ -49,6 +50,11 @@ class csr_tensor {
         MTL::ComputePipelineState* pso_update_xr;
         MTL::ComputePipelineState* pso_update_p;     
         MTL::ComputePipelineState* pso_spvmv;    
+        MTL::ComputePipelineState* pso_upomega_upxr_laa;
+        MTL::ComputePipelineState* pso_dip;
+        MTL::ComputePipelineState* pso_upalpha_ups;
+        MTL::ComputePipelineState* pso_upp;
+        MTL::ComputePipelineState* pso_f_spvmv;
 
         uint num_rows;
         uint num_cols;
@@ -269,7 +275,7 @@ class csr_tensor {
             MTL::Library* library = device->newLibrary(libraryPath, &error);
             
             if (!library) {
-                std::cerr << "Failed to load library: " << error->localizedDescription()->utf8String() << std::endl;
+                std::cerr << "Failed to load library: " << "spmv" << error->localizedDescription()->utf8String() << std::endl;
                 return;
             }
 
@@ -290,11 +296,13 @@ class csr_tensor {
             
             library->release();
 
+            ///////////////////////////////
+
             libraryPath = NS::String::string("./coo_csr.metallib", NS::UTF8StringEncoding);
             library = device->newLibrary(libraryPath, &error);
 
             if (!library) {
-                std::cerr << "Failed to load library: " << error->localizedDescription()->utf8String() << std::endl;
+                std::cerr << "Failed to load library: " << "coo csr " << error->localizedDescription()->utf8String() << std::endl;
                 return;
             }
 
@@ -309,17 +317,38 @@ class csr_tensor {
             
             library->release();
 
-            libraryPath = NS::String::string("./coo_csr.metallib", NS::UTF8StringEncoding);
+            ///////////////////////////////
+
+            libraryPath = NS::String::string("./cgd.metallib", NS::UTF8StringEncoding);
             library = device->newLibrary(libraryPath, &error);
 
             if (!library) {
-                std::cerr << "Failed to load library: " << error->localizedDescription()->utf8String() << std::endl;
+                std::cerr << "Failed to load library: " <<  " cgd " << error->localizedDescription()->utf8String() << std::endl;
                 return;
             }
 
             this->pso_zero = loadKernel("zero_out");
             this->pso_update_xr = loadKernel("update_xr");
             this->pso_update_p = loadKernel("update_p");
+
+            library->release();
+
+            ///////////////////////////////
+
+            libraryPath = NS::String::string("./bicgstab.metallib", NS::UTF8StringEncoding);
+            library = device->newLibrary(libraryPath, &error);
+
+            if (!library) {
+                std::cerr << "Failed to load library: " << "bicgstab" << error->localizedDescription()->utf8String() << std::endl;
+                return;
+            }
+
+            this->pso_upomega_upxr_laa = loadKernel("f_upomega_upxr_laa");
+            this->pso_dip = loadKernel("f_dip");
+            this->pso_f_spvmv = loadKernel("f_dspvmv");
+            this->pso_upalpha_ups = loadKernel("f_upalpha_ups");
+
+            this->pso_upp = loadKernel("upp");
 
             library->release();
 
@@ -545,9 +574,6 @@ class csr_tensor {
             MTL::Buffer* curr_r_norm = r_norm_old;
             MTL::Buffer* next_r_norm = r_norm_new;
 
-            int counter = 0;
-
-
             int iter_number = (1000 < this->num_rows) ? 1000 : this->num_rows;
             for (int i = 0; i < iter_number; i++) {
 
@@ -593,7 +619,7 @@ class csr_tensor {
                     cmd->commit();
                     cmd->waitUntilCompleted();
 
-                    if (*(float*) stage_r_norm->contents() < 1e-5) {
+                    if (*(float*) stage_r_norm->contents() < TOLERANCE) {
                         cmd = queue->commandBuffer();
                         enc = cmd->computeCommandEncoder();
 
@@ -608,7 +634,6 @@ class csr_tensor {
                 }
 
                 std::swap(curr_r_norm, next_r_norm);
-                counter++;
             }
 
             enc->endEncoding();
@@ -655,7 +680,7 @@ class csr_tensor {
 
         void bicgstab_op(
             float* x_vals,
-            float* b_vals,
+            float* b_vals
         ) {
             MTL::Buffer* x = this->device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
             MTL::Buffer* stage_b = this->device->newBuffer(b_vals, this->num_rows*sizeof(float), MTL::ResourceStorageModeShared);
@@ -665,6 +690,9 @@ class csr_tensor {
             MTL::Buffer* v = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
             MTL::Buffer* s = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
             MTL::Buffer* t = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* stage_r_norm = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
+            float* stage_r_norm_ptr = (float*)stage_r_norm->contents();
+            stage_r_norm_ptr[0] = 1.0e9f;
 
             //contains all the scalars needed for bigcgstab
             //0 : rho_prev
@@ -675,40 +703,36 @@ class csr_tensor {
             //5 : phi1
             //6 : phi2
             //7 : r_norm
-            float scalar_buffers_cpu[8] = []
+            float scalar_buffers_cpu[8] = {1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f};
             MTL::Buffer* scalars = device->newBuffer(8 * sizeof(float), MTL::ResourceStorageModePrivate);
-
-            MTL::Buffer* x = this->device->newBuffer(this->num_cols * sizeof(float), MTL::ResourceStorageModePrivate);
-            MTL::Buffer* stage_b = this->device->newBuffer(b_vals, this->num_rows*sizeof(float), MTL::ResourceStorageModeShared);
-            MTL::Buffer* r = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
-            MTL::Buffer* p = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
-            MTL::Buffer* Ap = device->newBuffer(this->num_rows * sizeof(float), MTL::ResourceStorageModePrivate);
-
-            MTL::Buffer* r_norm_old = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate);
-            MTL::Buffer* r_norm_new = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate);
-            MTL::Buffer* p_A_p = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModePrivate);
+            MTL::Buffer* stage_scalars = device->newBuffer(scalar_buffers_cpu, 8 * sizeof(float), MTL::ResourceStorageModeShared);
 
             MTL::CommandBuffer* cmd_blit = queue->commandBuffer();
             MTL::BlitCommandEncoder* blit_init = cmd_blit->blitCommandEncoder();
 
-            blit_init->fillBuffer(x, NS::Range::Make(0, this->num_cols * sizeof(float)), 0);
+            blit_init->fillBuffer(x, NS::Range::Make(0, this->num_rows * sizeof(float)), 0);
             blit_init->copyFromBuffer(stage_b, 0, r, 0, this->num_rows * sizeof(float));
+            blit_init->copyFromBuffer(stage_b, 0, r0, 0, this->num_rows * sizeof(float));
+            blit_init->fillBuffer(p, NS::Range::Make(0, this->num_rows * sizeof(float)), 0);
+            blit_init->fillBuffer(v, NS::Range::Make(0, this->num_rows * sizeof(float)), 0);
             blit_init->copyFromBuffer(stage_b, 0, p, 0, this->num_rows * sizeof(float));
+            blit_init->copyFromBuffer(stage_scalars, 0, scalars, 0, 8 * sizeof(float));
             blit_init->endEncoding();
             cmd_blit->commit();
             cmd_blit->waitUntilCompleted();
             
             stage_b->release();
+            stage_scalars->release();
 
             MTL::CommandBuffer* cmd_pre = queue->commandBuffer();
             MTL::ComputeCommandEncoder* enc_pre = cmd_pre->computeCommandEncoder();
-
-            zero(r_norm_old, r_norm_new, cmd_pre, enc_pre);
-            zero(r_norm_old, p_A_p, cmd_pre, enc_pre);
-
-            enc_pre->memoryBarrier(MTL::BarrierScopeBuffers);
-
-            inner_product(r, r, r_norm_old, this->num_rows, cmd_pre, enc_pre);
+            
+            enc_pre->setComputePipelineState(this->pso_iprd);
+            enc_pre->setBuffer(r, 0, 0);
+            enc_pre->setBuffer(r, 0, 1);
+            enc_pre->setBuffer(scalars, 1 * sizeof(float), 2);
+            enc_pre->setBytes(&this->num_rows, sizeof(uint), 3);
+            enc_pre->dispatchThreads(MTL::Size::Make(this->num_rows, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
             enc_pre->endEncoding();
             cmd_pre->commit();
             cmd_pre->waitUntilCompleted();
@@ -716,98 +740,113 @@ class csr_tensor {
             MTL::CommandBuffer* cmd = queue->commandBuffer();
             MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
 
-            MTL::Buffer* curr_r_norm = r_norm_old;
-            MTL::Buffer* next_r_norm = r_norm_new;
 
-            int counter = 0;
+            int iter_number = (5000 < this->num_rows) ? 5000 : this->num_rows;
+            bool left_early = false;
 
-
-            int iter_number = (1000 < this->num_rows) ? 1000 : this->num_rows;
             for (int i = 0; i < iter_number; i++) {
 
-                //upp
+                //upp: p,r,v,scalars & size
+
                 
-
-                //spVmV
-
-                //upalpha_ups
-
-                //f_dip
-
-                //f_upomega_upxr_laa
-
-                //zero
-
-                zero(p_A_p, next_r_norm, cmd, enc);
-                enc->memoryBarrier(MTL::BarrierScopeBuffers);
-
-                spvmv(p, p, Ap, p_A_p, cmd, enc);
-                enc->memoryBarrier(MTL::BarrierScopeBuffers);
-
-                enc->setComputePipelineState(pso_update_xr);
-                enc->setBuffer(x, 0, 0);
-                enc->setBuffer(r, 0, 1);
-                enc->setBuffer(p, 0, 2);
-                enc->setBuffer(Ap, 0, 3);
-                enc->setBuffer(curr_r_norm, 0, 4); 
-                enc->setBuffer(p_A_p, 0, 5);   
-                enc->setBuffer(next_r_norm, 0, 6); 
-                enc->setBytes(&this->num_rows, sizeof(uint), 7);
-                enc->dispatchThreads(MTL::Size::Make(this->num_rows, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
-                enc->memoryBarrier(MTL::BarrierScopeBuffers);
-
-                enc->setComputePipelineState(this->pso_update_p);
+                enc->setComputePipelineState(this->pso_upp);
                 enc->setBuffer(p, 0, 0);
                 enc->setBuffer(r, 0, 1);
-                enc->setBuffer(curr_r_norm, 0, 2); 
-                enc->setBuffer(next_r_norm, 0, 3); 
+                enc->setBuffer(v, 0, 2); 
+                enc->setBuffer(scalars, 0, 3); 
                 enc->setBytes(&this->num_rows, sizeof(uint), 4);
                 enc->dispatchThreads(MTL::Size::Make(this->num_rows, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
                 enc->memoryBarrier(MTL::BarrierScopeBuffers);
 
+                //spVmV:  sigma (scalars[4]) = r0 A p = r0 v
+
+                enc->setComputePipelineState(this->pso_spvmv);
+                enc->setBuffer(this->row_ptr, 0, 0);
+                enc->setBuffer(this->col_ind, 0, 1);
+                enc->setBuffer(this->vals, 0, 2);
+                enc->setBuffer(p, 0, 3);
+                enc->setBuffer(r0, 0, 4);
+                enc->setBuffer(v, 0, 5);
+                enc->setBuffer(scalars, 4 * sizeof(float), 6);
+                enc->setBytes(&this->num_rows, sizeof(uint32_t), 7);
+                enc->setBytes(&this->num_cols, sizeof(uint32_t), 8);
+                enc->dispatchThreads(MTL::Size::Make(SIMD_WIDTH * this->num_rows, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                //upalpha_ups: alpha (scalars[2]) = rho_curr / sigma , s = r - alpha * v 
+
+                enc->setComputePipelineState(this->pso_upalpha_ups);
+                enc->setBuffer(s, 0, 0);
+                enc->setBuffer(r, 0, 1);
+                enc->setBuffer(v, 0, 2);
+                enc->setBuffer(scalars, 0, 3);
+                enc->setBytes(&this->num_rows, sizeof(uint32_t), 7);
+                enc->dispatchThreads(MTL::Size::Make(this->num_rows, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                //mv: t = A * s
+
+                mv_buffer(s, t, cmd, enc);
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                //f_dip = phi_1 = t * s, phi_2 = t * t
+                enc->setComputePipelineState(this->pso_dip);
+                enc->setBuffer(s, 0, 0);
+                enc->setBuffer(t, 0, 1);
+                enc->setBuffer(scalars, 0, 2);
+                enc->setBytes(&this->num_rows, sizeof(uint32_t), 3);
+                enc->dispatchThreads(MTL::Size::Make(this->num_rows, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
+                //f_upomega_upxr_laa
+
+                enc->setComputePipelineState(pso_upomega_upxr_laa);
+                enc->setBuffer(x, 0, 0);
+                enc->setBuffer(r, 0, 1);
+                enc->setBuffer(p, 0, 2);
+                enc->setBuffer(r0, 0, 3);
+                enc->setBuffer(s, 0, 4); 
+                enc->setBuffer(t, 0, 5);
+                enc->setBuffer(scalars, 0, 6); 
+                enc->setBytes(&this->num_rows, sizeof(uint), 7);
+                enc->dispatchThreads(MTL::Size::Make(this->num_rows, 1, 1), MTL::Size::Make(THREADS_PER_GROUP, 1, 1));
+                enc->memoryBarrier(MTL::BarrierScopeBuffers);
+
                 if (i % CHECK_ITERATION_NUMBER == 0) {
-                    //blit back curr_r_norm
-                    enc->endEncoding();
-                    cmd->commit();
-                    cmd->waitUntilCompleted();
-
-                    MTL::Buffer* stage_r_norm = this->device->newBuffer(sizeof(float), MTL::ResourceStorageModeShared);
-                    
-                    cmd = queue->commandBuffer();
-                    MTL::BlitCommandEncoder* blit_check = cmd->blitCommandEncoder();
-                    blit_check->copyFromBuffer(curr_r_norm, 0, stage_r_norm, 0, sizeof(float));
-                    blit_check->endEncoding();
-                    cmd->commit();
-                    cmd->waitUntilCompleted();
-
-                    if (*(float*) stage_r_norm->contents() < 1e-5) {
-                        cmd = queue->commandBuffer();
-                        enc = cmd->computeCommandEncoder();
-
-                        break;
-                        
+                    if (i > 0) {
+                        if (stage_r_norm_ptr[0] < TOLERANCE) {
+                            left_early = true;
+                            break; 
+                        }
                     }
 
+                    enc->endEncoding();
+                    
+                    MTL::BlitCommandEncoder* blit_check = cmd->blitCommandEncoder();
+                    blit_check->copyFromBuffer(scalars, 7 * sizeof(float), stage_r_norm, 0, sizeof(float));
+                    blit_check->endEncoding();
 
+                    cmd->commit();
                     cmd = queue->commandBuffer();
                     enc = cmd->computeCommandEncoder();
-
                 }
-
-                std::swap(curr_r_norm, next_r_norm);
-                counter++;
             }
 
-            enc->endEncoding();
-            cmd->commit();
-            cmd->waitUntilCompleted();
+            if (!left_early){
+                enc->endEncoding();
+                cmd->commit();
+                cmd->waitUntilCompleted();
+            }
+
 
             r->release();
+            r0->release();
             p->release();
-            Ap->release();
-            r_norm_old->release();
-            r_norm_new->release();
-            p_A_p->release();
+            v->release();
+            s->release();
+            t->release();
+            scalars->release();
+            stage_r_norm->release();
 
 
             MTL::Buffer* stage_x = this->device->newBuffer(this->num_cols * sizeof(float), MTL::ResourceStorageModeShared);
@@ -842,5 +881,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_rows"),
              py::arg("num_cols"))
         .def("mv", &csr_tensor::mv, "spmvmul")
-        .def("cgd", &csr_tensor::cgd, "cgd");
+        .def("cgd", &csr_tensor::cgd, "cgd")
+        .def("bicgstab", &csr_tensor::bicgstab, "bicgstab");
 }

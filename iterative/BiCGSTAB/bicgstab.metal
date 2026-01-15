@@ -12,34 +12,65 @@ kernel void upp(
     device float* p [[buffer(0)]],
     device const float* r [[buffer(1)]],
     device const float* v [[buffer(2)]],
-    device const float* scalars [[buffer(3)]],
+    device float* scalars [[buffer(3)]],
     constant uint& size,
-    uint gid [[ thread_position_in_grid ]]
+    constant uint& mode,
+     uint gid [[thread_position_in_grid]],
+    uint tid [[thread_index_in_simdgroup]],
+    uint sid [[simdgroup_index_in_threadgroup]],
+    uint lid [[thread_position_in_threadgroup]]
 ) {
     //In the future, we should probably figure out a way to fuse the spmv (v = Ap) step with this step to reduce overhead
     //However, not implemented right now :sob:
 
-    threadgroup float rho_prev = scalars[0];
-    threadgroup float rho_curr = scalars[1];
-    threadgroup float alpha = scalars[2];
-    threadgroup float omega = scalars[3];
+    threadgroup float rho_prev;
+    threadgroup float rho_curr;
+    threadgroup float alpha;
+    threadgroup float omega;
+
+    if (lid == 0) {
+        rho_prev = scalars[mode];
+        rho_curr = scalars[(mode+1)%2];
+        alpha = scalars[2];
+        omega = scalars[3];
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (gid < size) {
         p[gid] = r[gid] + (rho_curr/rho_prev) * (alpha/omega) * (p[gid] - omega*v[gid]);
     }
+
+    //also must zero out sigma, phi_1, phi_2, r_norm
+
+    if (gid == 0) {
+        scalars[4] = 0.0f; //sigma
+        scalars[5] = 0.0f; //phi1
+        scalars[6] = 0.0f; //phi2
+        scalars[7] = 0.0f; //r_norm
+    }
 }
-kernel void upalpha_ups(
+kernel void f_upalpha_ups(
     device float* s [[buffer(0)]],
     device const float* r [[buffer(1)]],
     device const float* v [[buffer(2)]],
     device float* scalars [[buffer(3)]],
     constant uint& size,
-    uint gid [[thread_position_in_grid]]
+    constant uint& mode,
+    uint gid [[thread_position_in_grid]],
+    uint tid [[thread_index_in_simdgroup]],
+    uint sid [[simdgroup_index_in_threadgroup]],
+    uint lid [[thread_position_in_threadgroup]]
 ) {
     //In the future, we should probably figure out a way to fuse the spmv (t = As) step with this step to reduce overhead
     //However, not implemented right now :sob:
 
-    threadgroup float alpha = scalars[1] / scalars[4];
+    threadgroup float alpha;
+    if (lid == 0) {
+        alpha = scalars[(mode+1)%2] / scalars[4];
+    }
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (gid < size) {
         s[gid] = r[gid] - alpha * v[gid];
@@ -47,6 +78,9 @@ kernel void upalpha_ups(
 
     if (gid == 0) {
         scalars[2] = alpha;
+
+        //also zero out rho_prev
+        scalars[mode] = 0.0f;
     }
 
 }
@@ -110,6 +144,87 @@ kernel void f_dip(
     }   
 }
 
+kernel void f_dspvmv(
+    device const int* A_rows [[buffer(0)]],
+    device const int* A_cols [[buffer(1)]],
+    device const float* A_vals [[buffer(2)]],
+    device const float* x [[buffer(3)]],
+    device const float* y [[buffer(4)]],
+    device const float* z [[buffer(5)]],
+    device float* b [[buffer(6)]],
+    device atomic_float* ret_y [[buffer(7)]],
+    device atomic_float* ret_z [[buffer(8)]],
+    constant uint& num_rows,
+    constant uint& num_cols,
+    uint gid [[ thread_position_in_grid ]],
+    uint tid [[ thread_index_in_simdgroup ]],
+    uint sid [[ simdgroup_index_in_threadgroup ]],
+    uint lid [[ thread_position_in_threadgroup ]],
+    uint bid [[ threadgroup_position_in_grid ]]
+) {
+    //computes y A x and z A x, putting intermediate into b and final into ret_y, ret_z
+    //don't use yet, with alterations might be useful later
+    uint row = (bid*(THREADGROUP_SIZE/SIMD_WIDTH) + sid);
+    threadgroup float temp_y[THREADGROUP_SIZE/SIMD_WIDTH];
+    threadgroup float temp_z[THREADGROUP_SIZE/SIMD_WIDTH];
+
+    if (lid < (THREADGROUP_SIZE / SIMD_WIDTH)) {
+        temp_y[lid] = 0.0f;
+        temp_z[lid] = 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= num_rows) {
+        return;
+    }
+
+    int row_start = A_rows[row];
+    int row_end = A_rows[row + 1];
+
+    float p_sum = 0.0f;
+
+    for (int i = row_start + tid; i < row_end; i+= SIMD_WIDTH) {
+        int col_index = A_cols[i];
+        float val = A_vals[i];
+        float other_val = x[col_index];
+
+        p_sum += val*other_val;
+    
+    }
+
+    float complete_sum = simd_sum(p_sum);
+
+    if (tid == 0) {
+        b[row] = complete_sum;
+        temp_y[sid] = complete_sum * y[row];
+        temp_z[sid] = complete_sum * z[row];
+    }
+
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+
+    //reduction
+
+    if (lid == 0) {
+        float thread_group_sum_y = 0.0;
+        float thread_group_sum_z = 0.0;
+
+        for (int i = 0; i < THREADGROUP_SIZE/SIMD_WIDTH; i++) {
+            thread_group_sum_y += temp_y[i];
+            thread_group_sum_z += temp_z[i];
+        }
+
+        if (thread_group_sum_y != 0.0 && !isnan(thread_group_sum_y)) {
+            atomic_fetch_add_explicit(ret_y, thread_group_sum_y, memory_order_relaxed);
+        }
+        if (thread_group_sum_z != 0.0 && !isnan(thread_group_sum_z)) {
+            atomic_fetch_add_explicit(ret_z, thread_group_sum_z, memory_order_relaxed);
+        }
+    }
+}
+
 kernel void f_upomega_upxr_laa(
     device float* x [[buffer(0)]],
     device float* r [[buffer(1)]],
@@ -119,13 +234,19 @@ kernel void f_upomega_upxr_laa(
     device const float* t [[buffer(5)]],
     device float* scalars [[buffer(6)]],
     constant uint& size,
+    constant uint& mode,
     uint gid [[thread_position_in_grid]],
     uint tid [[thread_index_in_simdgroup]],
     uint sid [[simdgroup_index_in_threadgroup]],
     uint lid [[thread_position_in_threadgroup]]
 ) {
-    threadgroup float omega = scalars[5] / scalars[6];
-    threadgroup float alpha = scalars[2];
+    threadgroup float omega; 
+    threadgroup float alpha; 
+
+    if (lid == 0) {
+        omega = scalars[5] / scalars[6];
+        alpha = scalars[2];
+    }
 
     float micro_rho_sum = 0.0;
     float micro_norm_sum = 0.0;
@@ -173,7 +294,7 @@ kernel void f_upomega_upxr_laa(
         }
 
         if (thread_group_rho_sum != 0.0 && !isnan(thread_group_rho_sum)) {
-            atomic_fetch_add_explicit((device atomic_float*) &scalars[0], thread_group_rho_sum, memory_order_relaxed);
+            atomic_fetch_add_explicit((device atomic_float*) &scalars[mode], thread_group_rho_sum, memory_order_relaxed);
         }
 
         if (thread_group_norm_sum != 0.0 && !isnan(thread_group_norm_sum)) {
