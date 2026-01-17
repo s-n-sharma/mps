@@ -15,26 +15,51 @@ compile_metal("coo_csr")
 compile_metal("spmv")
 compile_metal("cgd")
 compile_metal("bicgstab")
+compile_metal("bcsr_spmv")
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 metal_cpp_path = os.path.join(current_dir, "metal-cpp")
 
-setup(
-    name='spmv',
-    ext_modules=[
-        CppExtension(
-            name='spmv',
-            sources=['spmv.cpp'],
-            include_dirs=[metal_cpp_path],
-            extra_compile_args=['-std=c++17'],
-            extra_link_args=[
-                '-framework', 'Metal', 
-                '-framework', 'Foundation', 
-                '-framework', 'QuartzCore'
-            ],
-        ),
-    ],
-    cmdclass={
-        'build_ext': BuildExtension
-    }
-)
+mode = 0
+
+if (mode == 0):
+    setup(
+        name='spmv',
+        ext_modules=[
+            CppExtension(
+                name='spmv',
+                sources=['spmv.cpp'],
+                include_dirs=[metal_cpp_path],
+                extra_compile_args=['-std=c++17'],
+                extra_link_args=[
+                    '-framework', 'Metal', 
+                    '-framework', 'Foundation', 
+                    '-framework', 'QuartzCore'
+                ],
+            ),
+        ],
+        cmdclass={
+            'build_ext': BuildExtension
+        }
+    )
+
+else:
+    setup(
+        name='bcsr',
+        ext_modules=[
+            CppExtension(
+                name='bcsr',
+                sources=['bcsr.cpp'],
+                include_dirs=[metal_cpp_path],
+                extra_compile_args=['-std=c++17'],
+                extra_link_args=[
+                    '-framework', 'Metal', 
+                    '-framework', 'Foundation', 
+                    '-framework', 'QuartzCore'
+                ],
+            ),
+        ],
+        cmdclass={
+            'build_ext': BuildExtension
+        }
+    )
